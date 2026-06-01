@@ -1,0 +1,419 @@
+From 21d3661303d08c95ffd85d1e3fc6731165e1b0a4 Mon Sep 17 00:00:00 2001
+From: Mavis <Mavis@local>
+Date: Mon, 1 Jun 2026 07:05:49 +0000
+Subject: [PATCH] Add allow command: time-limited usage that auto-blocks
+
+Adds the `freeblock allow <list> <duration>` command, the mirror of
+`lock`. While the allowance is running the list is unblocked so the
+user can use the apps freely. When the duration elapses, the Worker
+transitions the list into a manual block and the apps get killed
+within the next tick.
+
+- SDK: BlockList gains AllowanceStart, AllowanceDuration,
+  AllowanceEndTime, InAllowancePeriod, AllowanceExpired, and
+  AllowanceRemaining. Active now also flips on when an allowance has
+  expired.
+- CLI: new DurationArgument accepts HH:MM:SS, HH:MM, and shorthand
+  like 20m / 1h / 1h20m / 90s. The status command shows the remaining
+  allowance time, and block / unblock / lock cancel any pending
+  allowance (with a friendly note).
+- Daemon: new AllowAsync hub method; BlockAsync, UnblockAsync, and
+  LockAsync all clear any pending allowance so state stays
+  consistent. Worker's per-second loop now transitions expired
+  allowances into ManuallyBlocked = true so the regular `unblock`
+  command can clear them afterward.
+- Docs: README and TUTORIAL updated with the new feature.
+---
+ CLI/Command.cs             | 55 +++++++++++++++++++++++++++++++++++++-
+ CLI/Program.cs             | 42 +++++++++++++++++++++++++++--
+ Daemon/CommunicationHub.cs | 21 +++++++++++++++
+ Daemon/Worker.cs           | 21 +++++++++++++++
+ README.md                  |  3 +++
+ SDK/BlockList.cs           | 32 +++++++++++++++++++++-
+ TUTORIAL.md                | 19 ++++++++++++-
+ 7 files changed, 188 insertions(+), 5 deletions(-)
+
+diff --git a/CLI/Command.cs b/CLI/Command.cs
+index e827476..fc43ca9 100644
+--- a/CLI/Command.cs
++++ b/CLI/Command.cs
+@@ -1,4 +1,5 @@
+-﻿using Microsoft.AspNetCore.SignalR.Client;
++﻿using System.Text.RegularExpressions;
++using Microsoft.AspNetCore.SignalR.Client;
+ using SDK;
+ 
+ namespace CLI;
+@@ -114,6 +115,58 @@ public record TimeArgument(string Name) : Argument<TimeOnly>(Name)
+     }
+ }
+ 
++public record DurationArgument(string Name) : Argument<TimeSpan>(Name)
++{
++    // Accepts e.g. "20m", "1h", "1h20m", "1h20m30s", "90s"
++    private static readonly Regex ShorthandRegex = new(
++        @"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$",
++        RegexOptions.IgnoreCase
++    );
++
++    public override async Task<bool> Validate(string input)
++    {
++        var trimmed = input.Trim();
++
++        // Try TimeSpan / TimeOnly format first (HH:MM:SS, HH:MM, 1.02:00:00, etc.)
++        TimeSpan ts;
++        if (TimeSpan.TryParse(trimmed, out var parsedTs)) ts = parsedTs;
++        else if (TimeOnly.TryParse(trimmed, out var parsedTo)) ts = parsedTo.ToTimeSpan();
++        else goto Shorthand;
++
++        if (ts <= TimeSpan.Zero)
++        {
++            Console.WriteLine($"[{Name}] must be greater than zero");
++            return false;
++        }
++
++        Value = ts;
++        return true;
++
++    Shorthand:
++
++        // Try shorthand (20m, 1h, 1h20m, 90s)
++        var match = ShorthandRegex.Match(trimmed.ToLowerInvariant());
++        if (match.Success)
++        {
++            int hours = match.Groups[1].Success ? int.Parse(match.Groups[1].Value) : 0;
++            int minutes = match.Groups[2].Success ? int.Parse(match.Groups[2].Value) : 0;
++            int seconds = match.Groups[3].Success ? int.Parse(match.Groups[3].Value) : 0;
++
++            if (hours == 0 && minutes == 0 && seconds == 0)
++            {
++                Console.WriteLine($"[{Name}] must be greater than zero (e.g. 20m, 1h, 1h20m)");
++                return false;
++            }
++
++            Value = new TimeSpan(hours, minutes, seconds);
++            return true;
++        }
++
++        Console.WriteLine($"[{Name}] must be a valid duration: HH:MM:SS, HH:MM, or shorthand like 20m, 1h, 1h20m");
++        return false;
++    }
++}
++
+ public record DaysArgument(string Name) : Argument<DayOfWeek[]>(Name)
+ {
+     public override async Task<bool> Validate(string input)
+diff --git a/CLI/Program.cs b/CLI/Program.cs
+index 055fd8c..b94e334 100644
+--- a/CLI/Program.cs
++++ b/CLI/Program.cs
+@@ -71,6 +71,12 @@ CommandSystem.Register(new Command(
+     Lock
+ ));
+ 
++CommandSystem.Register(new Command(
++    ["allow"],
++    [new ListArgument("list"), new DurationArgument("duration")],
++    Allow
++));
++
+ CommandSystem.Register(new Command(
+     ["schedule", "add"],
+     [
+@@ -124,6 +130,7 @@ void ShowHelp()
+                       freeblock block            Enable manual block for a list.
+                       freeblock unblock          Disable manual block for a list.
+                       freeblock lock             Lock a list for the provided amount of time. You won't be able to disable it until the timer ends.
++                      freeblock allow            Allow using a list for a duration, then auto-block. Time formats: HH:MM:SS, HH:MM, 20m, 1h, 1h20m.
+                       freeblock schedule add     Create a new schedule to enable lists automatically on certain time periods.
+                       freeblock schedule rename  Rename a schedule.
+                       freeblock schedule remove  Remove a schedule. Removing schedules while they're active is not allowed.
+@@ -154,8 +161,15 @@ async Task ShowStatus()
+             blockReasons.Add($"⏰ {string.Join(", ", blockingSchedules.Select(e => e.Name))}");
+         }
+ 
++        if (list.AllowanceExpired) blockReasons.Add("⏰ allowance expired");
++
++        // Allowance in progress (list is currently usable, show remaining time)
++        string allowanceInfo = "";
++        if (list.InAllowancePeriod && list.AllowanceRemaining is { } remaining)
++            allowanceInfo = $" [⏳ {remaining.Hours:D2}:{remaining.Minutes:D2}:{remaining.Seconds:D2} remaining]";
++
+         string reasonsString = blockReasons.Count == 0 ? "" : $" ({string.Join(", ", blockReasons)})";
+-        Console.WriteLine($"📋{(list.Active ? "🟢" : "🔴")} {list.Name}{reasonsString}");
++        Console.WriteLine($"📋{(list.Active ? "🟢" : "🔴")} {list.Name}{reasonsString}{allowanceInfo}");
+     }
+ 
+     // Schedules
+@@ -304,6 +318,9 @@ async Task Block(ListArgument argument)
+         return;
+     }
+ 
++    if (list.InAllowancePeriod)
++        ConsoleUtils.Note($"Cancelling active allowance to start manual block");
++
+     if (!list.Active && !ConsoleUtils.PromptClose()) return;
+ 
+     await ConnectionManager.Connection!.InvokeAsync("BlockAsync", list);
+@@ -329,7 +346,10 @@ async Task Unblock(ListArgument argument)
+         else if (schedules.Count != 0) ConsoleUtils.Warning($"The list remains blocked by active schedules: {string.Join(", ", schedules)}");
+     }
+ 
+-    if (!list.ManuallyBlocked)
++    if (list.InAllowancePeriod)
++        ConsoleUtils.Note($"Cancelling active allowance to unblock manually");
++
++    if (!list.ManuallyBlocked && !list.InAllowancePeriod && !list.AllowanceExpired)
+     {
+         Console.WriteLine($"Manual block is already disabled: {list.Name}");
+         return;
+@@ -353,6 +373,7 @@ async Task Lock(ListArgument listArgument, TimeArgument timeArgument)
+ 
+     var prompt = $"This will block {list.Name} for {time}";
+     if (!list.Active) prompt += " and close all browsers and all blocked apps";
++    if (list.InAllowancePeriod) prompt += " (cancelling active allowance)";
+     prompt += ". Okay to continue?";
+ 
+     if (!ConsoleUtils.PromptYesNo(prompt)) return;
+@@ -361,6 +382,23 @@ async Task Lock(ListArgument listArgument, TimeArgument timeArgument)
+     Console.WriteLine($"Locked list for {time}: {list.Name}");
+ }
+ 
++async Task Allow(ListArgument listArgument, DurationArgument durationArgument)
++{
++    var list = listArgument.Value!;
++    var duration = durationArgument.Value!;
++    var allowanceStart = DateTime.Now;
++
++    if (list.InAllowancePeriod && list.AllowanceRemaining is { } remaining)
++        ConsoleUtils.Note($"Replacing current allowance ({remaining.Hours:D2}:{remaining.Minutes:D2}:{remaining.Seconds:D2} remaining) with a new one");
++
++    var prompt = $"This will allow you to use {list.Name} for {duration}. Once the time runs out, all browsers and blocked apps will close automatically. Okay to continue?";
++
++    if (!ConsoleUtils.PromptYesNo(prompt)) return;
++    await ConnectionManager.Connection!.InvokeAsync("AllowAsync", list, allowanceStart, duration);
++
++    Console.WriteLine($"Allowance started for {duration}: {list.Name}");
++}
++
+ async Task AddSchedule(AddScheduleArgument name, ArrayArgument<BlockList, ListArgument> lists, TimeArgument start, TimeArgument end, DaysArgument days)
+ {
+     var schedule = new Schedule
+diff --git a/Daemon/CommunicationHub.cs b/Daemon/CommunicationHub.cs
+index 9a0b645..936a040 100644
+--- a/Daemon/CommunicationHub.cs
++++ b/Daemon/CommunicationHub.cs
+@@ -41,6 +41,7 @@ public class CommunicationHub : Hub
+     {
+         var localList = GetLocalList(list);
+         localList!.ManuallyBlocked = true;
++        ClearAllowance(localList);
+ 
+         await ApplyChanges();
+     }
+@@ -49,6 +50,7 @@ public class CommunicationHub : Hub
+     {
+         var localList = GetLocalList(list);
+         localList!.ManuallyBlocked = false;
++        ClearAllowance(localList);
+ 
+         await ApplyChanges();
+     }
+@@ -57,10 +59,29 @@ public class CommunicationHub : Hub
+     {
+         var localList = GetLocalList(list);
+         localList.UnlockTime = unlockTime;
++        ClearAllowance(localList);
+ 
+         await ApplyChanges();
+     }
+ 
++    public async Task AllowAsync(BlockList list, DateTime allowanceStart, TimeSpan duration)
++    {
++        var localList = GetLocalList(list);
++        localList.AllowanceStart = allowanceStart;
++        localList.AllowanceDuration = duration;
++        // Starting an allowance implies the user wants the list unblocked right now.
++        localList.ManuallyBlocked = false;
++        localList.UnlockTime = null;
++
++        await ApplyChanges();
++    }
++
++    private static void ClearAllowance(BlockList list)
++    {
++        list.AllowanceStart = null;
++        list.AllowanceDuration = null;
++    }
++
+     public async Task AddScheduleAsync(Schedule schedule)
+     {
+         State.Schedules.Add(schedule);
+diff --git a/Daemon/Worker.cs b/Daemon/Worker.cs
+index fd02d59..dcf9db7 100644
+--- a/Daemon/Worker.cs
++++ b/Daemon/Worker.cs
+@@ -10,6 +10,7 @@ public class Worker(ILogger<Worker> logger) : BackgroundService
+         while (!token.IsCancellationRequested)
+         {
+             State.Update();
++            await ApplyExpiredAllowances();
+             await NotificationManager.UpdateAsync();
+             await Blocker.UpdateAsync();
+ 
+@@ -19,4 +20,24 @@ public class Worker(ILogger<Worker> logger) : BackgroundService
+             await Task.Delay(1000, token);
+         }
+     }
++
++    // When an allowance's duration elapses, transition the list into a manual
++    // block so the rest of the system sees it as actively blocked and the
++    // user can clear it with the regular `unblock` command.
++    private static async Task ApplyExpiredAllowances()
++    {
++        bool changed = false;
++
++        foreach (var list in State.BlockLists)
++        {
++            if (!list.AllowanceExpired) continue;
++
++            list.AllowanceStart = null;
++            list.AllowanceDuration = null;
++            list.ManuallyBlocked = true;
++            changed = true;
++        }
++
++        if (changed) State.Save();
++    }
+ }
+diff --git a/README.md b/README.md
+index 8f52919..86ae05d 100644
+--- a/README.md
++++ b/README.md
+@@ -22,6 +22,7 @@ FreeBlock is a cross-platform blocker that helps you focus by managing access to
+ 
+ - **Manual blocking:** Create block lists and block them manually
+ - **Timed locks:** Prevent disabling lists until a timer runs out
++- **Allowances:** Allow using a list for a duration; it auto-blocks when the time runs out
+ - **Scheduled blocking:** Create schedules to enable lists automatically
+ - **No setup:** Supports all browsers and apps with no setup out of the box
+ - **Cross-platform:** Supports Linux, macOS and Windows
+@@ -38,6 +39,7 @@ FreeBlock is a cross-platform blocker that helps you focus by managing access to
+ - `freeblock block`: Enable manual block for a list.
+ - `freeblock unblock`: Disable manual block for a list.
+ - `freeblock lock`: Lock a list for the provided amount of time. You won't be able to disable it until the timer ends.
++- `freeblock allow`: Allow using a list for a duration (e.g. `20m`, `1h`, `1h20m`, `00:20:00`), then auto-block. Mirror of `lock`.
+ - `freeblock schedule add`: Create a new schedule.
+ - `freeblock schedule rename`: Rename a schedule.
+ - `freeblock schedule remove`: Remove a schedule. Removing schedules while they're active is not allowed.
+@@ -75,6 +77,7 @@ If you spot any bugs, have any feature requests or just want to share your thoug
+ - [x] Schedules
+ - [x] Better onboarding
+ - [x] Blocking apps
++- [x] Allowances (time-limited usage)
+ - [ ] Editing schedules
+ - [ ] Requesting schedule removal
+ - [ ] macOS and Windows builds
+diff --git a/SDK/BlockList.cs b/SDK/BlockList.cs
+index c529bc1..6dc1140 100644
+--- a/SDK/BlockList.cs
++++ b/SDK/BlockList.cs
+@@ -7,7 +7,7 @@ public class BlockList : IStateObject
+     public string Name { get; set; } = string.Empty;
+     [JsonProperty("UrlList")] public List<string> Entries { get; init; } = [];
+     public bool ManuallyBlocked { get; set; }
+-    public bool Active => ManuallyBlocked || Locked || Scheduled;
++    public bool Active => ManuallyBlocked || Locked || Scheduled || AllowanceExpired;
+ 
+     // Locks
+     public bool Locked => UnlockTime != null && UnlockTime > DateTime.Now;
+@@ -15,4 +15,34 @@ public class BlockList : IStateObject
+ 
+     // Schedules
+     public bool Scheduled { get; set; }
++
++    // Allowances (time-limited usage sessions)
++    // While an allowance is running, the list is not blocked so the user
++    // can use the apps freely. Once the duration elapses, the list becomes
++    // active (blocked) again - the Worker transitions that into a manual
++    // block so the user can unblock as usual.
++    public DateTime? AllowanceStart { get; set; }
++    public TimeSpan? AllowanceDuration { get; set; }
++
++    public DateTime? AllowanceEndTime =>
++        AllowanceStart != null && AllowanceDuration != null
++            ? AllowanceStart.Value + AllowanceDuration.Value
++            : null;
++
++    public bool InAllowancePeriod =>
++        AllowanceEndTime != null && DateTime.Now < AllowanceEndTime;
++
++    public bool AllowanceExpired =>
++        AllowanceEndTime != null && DateTime.Now >= AllowanceEndTime;
++
++    public TimeSpan? AllowanceRemaining
++    {
++        get
++        {
++            var end = AllowanceEndTime;
++            if (end == null) return null;
++            var remaining = end.Value - DateTime.Now;
++            return remaining > TimeSpan.Zero ? remaining : null;
++        }
++    }
+ }
+diff --git a/TUTORIAL.md b/TUTORIAL.md
+index 6e9c8e4..36e07d6 100644
+--- a/TUTORIAL.md
++++ b/TUTORIAL.md
+@@ -11,6 +11,7 @@
+ - [Editing Lists](#editing-lists)
+ - [Removing Lists](#removing-lists)
+ - [Timed Locks](#timed-locks)
++- [Allowances](#allowances)
+ - [Creating Schedules](#creating-schedules)
+ - [Editing Schedules](#editing-schedules)
+ - [Removing Schedules](#removing-schedules)
+@@ -28,8 +29,9 @@ FreeBlock allows you to restrict access to distracting apps and websites to focu
+ - When a list is **enabled**, all of its apps and websites are blocked
+ - **Manual block** allows you to enable or disable a list on-demand
+ - **Timed locks** enable a list until a timer runs out
++- **Allowances** let you use a list freely for a duration; the list auto-blocks once the time runs out
+ - **Schedules** enable lists automatically in certain time periods
+-- A list will be enabled if it's either locked, scheduled, or blocked manually
++- A list will be enabled if it's either locked, scheduled, blocked manually, or its allowance has expired
+ 
+ ## Basic Usage
+ 
+@@ -120,6 +122,20 @@ If you now run `freeblock status`, the list will appear as enabled and locked un
+ 
+ ![](Tutorial14.png)
+ 
++## Allowances
++
++Allowances are the mirror of timed locks. Where `lock` blocks a list for a duration, `allow` lets you use a list freely for a duration, after which it auto-blocks. This is great for "let me scroll social media for 20 minutes, then I'm done" sessions.
++
++Let's try starting an allowance on our list by running `freeblock allow [list] [duration]`. I'll allow 20 minutes.
++
++> Make sure to provide the duration in a supported format: `HH:MM:SS`, `HH:MM`, or shorthand like `20m`, `1h`, `1h20m`, `90s`.
++
++After you confirm, the list is unblocked and you can use the apps in it. If you now run `freeblock status`, the list will appear as disabled with a `⏳ ... remaining` annotation showing the time left in your allowance.
++
++When the duration runs out, FreeBlock automatically transitions the list into a manual block. The list is now active and the apps will close. You can clear this block at any time with the regular `freeblock unblock` command.
++
++> Note: running `freeblock block`, `freeblock unblock`, or `freeblock lock` on a list with an active allowance will cancel the allowance immediately. Running `freeblock allow` on a list with an active allowance will replace it with a new one (the timer resets).
++
+ ## Creating Schedules
+ 
+ Schedules enable lists automatically in certain time periods. Let's try creating one in order to block distracting apps and websites at night. To do that, we will use the `freeblock schedule add [name] [lists] [start] [end] [days]` command.
+@@ -169,6 +185,7 @@ To remove a schedule, use `freeblock schedule remove [name]`. Note that you can'
+ - `freeblock block`: Enable manual block for a list.
+ - `freeblock unblock`: Disable manual block for a list.
+ - `freeblock lock`: Lock a list for the provided amount of time. You won't be able to disable it until the timer ends.
++- `freeblock allow`: Allow using a list for a duration (e.g. `20m`, `1h`, `00:20:00`), then auto-block. Mirror of `lock`.
+ - `freeblock schedule add`: Create a new schedule.
+ - `freeblock schedule rename`: Rename a schedule.
+ - `freeblock schedule remove`: Remove a schedule. Removing schedules while they're active is not allowed.
+-- 
+2.39.5
+
